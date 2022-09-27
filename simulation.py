@@ -5,32 +5,38 @@ from dataclasses import dataclass
 import random
 import matplotlib.animation as animation
 import copy
+import pickle
 
-SIM_WIDTH = 100
-SIM_HEIGHT = 10
+SIM_WIDTH = 50
+SIM_HEIGHT = 50
+
+PERSON_MAX_ENERGY = 10
+PERSON_STEP_SIZE = 20
+PERSON_MOVE_COST = 1
+
+VENDOR_STEP_SIZE = PERSON_STEP_SIZE/2
+VENDOR_MAX_WAIT_TIME = 30
+VENDOR_EXPLORE_SIZE = 5
+
 
 @dataclass
-class position:
-    x: float
-    y: float
+class Position:
+    coords: np.array
 
     def dist(self, other_position):
-        return np.sqrt((self.x-other_position.x)**2 + (self.y-other_position.y)**2)
+        return np.sqrt(np.sum(np.power(self.coords - other_position.coords, 2)))
 
     def vector(self, other_position):
-        x_dir = other_position.x - self.x
-        y_dir = other_position.y - self.y
-        vec = np.array((x_dir,y_dir))
+        diff = other_position.coords - self.coords
+        vec = np.array(diff)
         return vec/np.linalg.norm(vec)
 
     def move_to_target(self, goal, step_size):
         if self.dist(goal)<step_size:
-            self.x = goal.x
-            self.y = goal.y
+            self.coords = np.copy(goal.coords)
             return True
         v = self.vector(goal)
-        self.x += v[0]*step_size
-        self.y += v[1]*step_size
+        self.coords += v*step_size
 
     @staticmethod
     def rand_dir():
@@ -40,37 +46,51 @@ class position:
         norm = np.linalg.norm((xdir,ydir))
         return(vec/norm)
 
+    @staticmethod
+    def check_boundary(pos):
+        x_bound = True
+        y_bound = True
+        if pos.coords[0] < 0 or pos.coords[0] > SIM_WIDTH:
+            x_bound = False
+        if pos.coords[1] < 0 or pos.coords[1] > SIM_HEIGHT:
+            y_bound = False
+        return np.array((x_bound,y_bound))
+
 
 @dataclass
-class vendor:
-    pos: position
+class Vendor:
+    pos: Position
     total_sales: int
     position_sales: int
-    best_pos: position
+    best_pos: Position
     best_sales: int
     wait_time: int
     moving: bool
-    next_pos: position
+    next_pos: Position
 
-    step_size = 0.5
-    max_wait_time = 20
-    explore_size = 4
+    step_size = VENDOR_STEP_SIZE
+    max_wait_time = VENDOR_MAX_WAIT_TIME
+    explore_size = VENDOR_EXPLORE_SIZE
 
     @classmethod
     def new_random_pos(cls, x_range, y_range):
         x = random.random()*(x_range[1]-x_range[0])+x_range[0]
         y = random.random()*(y_range[1]-y_range[0])+y_range[0]
-        return cls(position(x,y), 0, 0, position(x,y), 0, 0, False, position(x,y))
+        return cls(Position(np.array((x,y))), 0, 0, Position(np.array((x,y))), 0, 0, False, Position(np.array((x,y))))
 
     def sale(self):
         self.position_sales += 1
         self.total_sales += 1
 
     def pick_new_pos(self, pos, x_range=None, y_range=None):
-        new_dir = self.explore_size * position.rand_dir()
-        new_x = pos.x + new_dir[0]
-        new_y = pos.y + new_dir[1]
-        return position(new_x,new_y)
+        new_dir = self.explore_size * Position.rand_dir() * random.random()
+        new_pos = Position(pos.coords + new_dir)
+        in_bound = Position.check_boundary(new_pos)
+        if not in_bound[0]:
+            new_pos.coords[0] = pos.coords[0] - new_dir[0]
+        if not in_bound[1]:
+            new_pos.coords[1] = pos.coords[1] - new_dir[1]
+        return new_pos 
 
     def timestep(self):
         if self.moving:
@@ -86,6 +106,8 @@ class vendor:
                     new_pos = self.pick_new_pos(self.best_pos)
                 self.moving = True
                 self.next_pos = new_pos
+                print(self.position_sales)
+                print(self.best_pos)
     
     def move_to_target(self, goal):
         reached_goal = self.pos.move_to_target(goal, self.step_size)
@@ -97,22 +119,23 @@ class vendor:
 
 
 @dataclass
-class person:
-    pos: position
+class Person:
+    pos: Position
     hungry: bool
     energy: float
-    target: position
+    target: Position
+    vend: Vendor
 
-    max_energy = 10
-    move_cost = 1
-    step_size = 1
+    max_energy = PERSON_MAX_ENERGY
+    move_cost = PERSON_MOVE_COST
+    step_size = PERSON_STEP_SIZE
 
     @classmethod
     def new_random_pos(cls, x_range, y_range):
         x = random.random()*(x_range[1]-x_range[0])+x_range[0]
         y = random.random()*(y_range[1]-y_range[0])+y_range[0]
         energy = random.random()*cls.max_energy
-        return cls(position(x,y), False, energy, None)
+        return cls(Position((x,y)), False, energy, None, None)
 
     def move(self,x_range=None,y_range=None):
         if self.hungry:
@@ -127,47 +150,49 @@ class person:
         self.energy = self.max_energy
         self.target = None
         self.hungry = False
+        self.vend.sale()
+        self.vend = None
     
-    def set_target(self, target_pos):
-        self.target = target_pos
+    def set_target(self, target_vendor):
+        self.vend = target_vendor
+        # We do want this to point to the vendor's position, and not a copy
+        self.target = target_vendor.pos
 
     def wander(self,x_range=None,y_range=None):
-        xdir = random.random()-0.5
-        ydir = random.random()-0.5
-        norm = np.linalg.norm((xdir,ydir))
-        x_update = xdir*self.step_size/norm 
-        y_update = ydir*self.step_size/norm
-        self.update_pos(x_update,y_update,x_range=x_range,y_range=y_range)
+        rand_dir = self.step_size * Position.rand_dir() * random.random()
+        new_pos = Position(self.pos.coords + rand_dir)
+        if Position.check_boundary(new_pos).all():
+            self.pos = new_pos
     
     def move_to_target(self,x_range=None,y_range=None):
         reached_goal = self.pos.move_to_target(self.target,self.step_size)
         if reached_goal:
             self.eat()
     
-    def update_pos(self,x_vec,y_vec,x_range,y_range):
-        new_x = self.pos.x + x_vec
-        new_y = self.pos.y + y_vec
-        if new_x < x_range[0] or new_x > x_range[1]:
-            self.pos.x -= x_vec
-        else:
-            self.pos.x = new_x
-        if new_y < y_range[0] or new_y > y_range[1]:
-            self.pos.y -= y_vec
-        else:
-            self.pos.y = new_y
+    # def update_pos(self,x_vec,y_vec,x_range,y_range):
+    #     new_x = self.pos.x + x_vec
+    #     new_y = self.pos.y + y_vec
+    #     if new_x < x_range[0] or new_x > x_range[1]:
+    #         self.pos.x -= x_vec
+    #     else:
+    #         self.pos.x = new_x
+    #     if new_y < y_range[0] or new_y > y_range[1]:
+    #         self.pos.y -= y_vec
+    #     else:
+    #        self.pos.y = new_y
 
 @dataclass
 class environment:
-    vendors: List[vendor]
-    people: List[person]
+    vendors: List[Vendor]
+    people: List[Person]
     time: float
     width: float
     height: float
 
     @classmethod
     def create_new(cls, x_len, y_len, num_vendors, num_people):
-        vendors = [vendor.new_random_pos((0,x_len),(0,y_len)) for i in range(num_vendors)]
-        people = [person.new_random_pos((0,x_len),(0,y_len)) for i in range(num_people)]
+        vendors = [Vendor.new_random_pos((0,x_len),(0,y_len)) for i in range(num_vendors)]
+        people = [Person.new_random_pos((0,x_len),(0,y_len)) for i in range(num_people)]
         return cls(vendors, people, 0, x_len, y_len)
 
     def nearest_vendor(self, position):
@@ -196,39 +221,48 @@ class environment:
             p.move(x_range=(0,self.width),y_range=(0,self.height))
             if p.energy <= 0:
                 vendor = self.pick_vendor(p.pos)
-                p.set_target(vendor.pos)
+                p.set_target(vendor)
         self.time += 1
         print(f"time: {self.time}")
 
     def get_vendor_positions(self):
-        x = [person.pos.x for person in self.vendors]
-        y = [person.pos.y for person in self.vendors]
+        x = [person.pos.coords[0] for person in self.vendors]
+        y = [person.pos.coords[1] for person in self.vendors]
         return x,y
  
     def get_people_positions(self):
-        x = [person.pos.x for person in self.people]
-        y = [person.pos.y for person in self.people]
+        x = [person.pos.coords[0] for person in self.people]
+        y = [person.pos.coords[1] for person in self.people]
         return x,y
     
 if __name__ == "__main__":
     random.seed(1234)
+    sim_time = 10000
+    num_people = 400
+    num_vendors = 2
+
     print("running")
-    width = 100
-    height = 10
+    width = SIM_WIDTH
+    height = SIM_HEIGHT
 
     fig, ax = plt.subplots()
-    beach = environment.create_new(width,height,2,10)
+    beach = environment.create_new(width,height,num_vendors,num_people)
     def aniplot(i):
         beach.timestep()
+        for i in beach.people:
+            if not Position.check_boundary(i.pos).all():
+                print("shit")
         people_x, people_y = beach.get_people_positions()
         vendor_x, vendor_y = beach.get_vendor_positions()
         
         ax.clear()
         ax.set_xlim(0,width)
         ax.set_ylim(0,height)
-        people_artist = ax.scatter(people_x,people_y,marker='o',color="blue")
+        people_artist = ax.scatter(people_x,people_y,marker='o',color="blue",s=5)
         vendor_artist = ax.scatter(vendor_x,vendor_y,marker='x',color="red")
         return [people_artist,vendor_artist] 
     
-    ani = animation.FuncAnimation(fig, aniplot, np.arange(1, 200), interval=25, blit=True)
-    ani.save('animation.gif', writer='ffmpeg', fps=20)
+    ani = animation.FuncAnimation(fig, aniplot, np.arange(1, sim_time), interval=25, blit=True)
+    ani.save('animation.gif', writer='ffmpeg', fps=10)
+    with open("1_out","wb") as f:
+        pickle.dump(beach,f)    
